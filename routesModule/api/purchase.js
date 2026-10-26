@@ -1,11 +1,7 @@
 require('dotenv').config();
 const axios = require('axios');
 const nodemailer = require('nodemailer');
-const faunadb = require('faunadb');
-const client = new faunadb.Client({
-  secret: process.env.FAUNADB_SECRET,
-});
-const q = faunadb.query;
+const { pool, findToken, markTokenUsed } = require('../../database');
 
 function generateToken(length) {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -17,10 +13,9 @@ function generateToken(length) {
   return token;
 }
 
-// Configure nodemailer with your email service provider details
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT,
+  port: Number(process.env.SMTP_PORT) || 587,
   secure: false,
   auth: {
     user: process.env.SMTP_USERNAME,
@@ -31,10 +26,10 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+const CLOUD_API_BASE_URL = process.env.CLOUD_API_BASE_URL || 'https://users.roblox.com';
+
 async function purchaseapi(req, res) {
   const { rbxusername, email } = req.body;
-
-  // Check for empty fields
   const requiredFields = ['rbxusername', 'email'];
   const missingFields = requiredFields.filter((field) => !req.body[field]);
 
@@ -45,59 +40,52 @@ async function purchaseapi(req, res) {
   }
 
   try {
-    const data = {
-      usernames: [rbxusername],
-      excludeBannedUsers: true,
-    };
+    const userLookupUrl = `${CLOUD_API_BASE_URL}/v1/usernames/users`;
+    const userInfoResponse = await axios.post(
+      userLookupUrl,
+      { usernames: [rbxusername], excludeBannedUsers: true },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
 
-    const header = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    };
-
-    const usersUrl = 'https://users.roblox.com/v1/usernames/users';
-    const userInfoResponse = await axios.post(usersUrl, data, { headers: header });
     const userInfoData = userInfoResponse.data;
-
-    if (userInfoData.data.length === 0) {
-      return res.status(401).json({
-        message: 'Invalid Username',
-      });
+    if (!userInfoData || !Array.isArray(userInfoData.data) || userInfoData.data.length === 0) {
+      return res.status(401).json({ message: 'Invalid Username' });
     }
 
     const rbxuserId = userInfoData.data[0].id;
-
-    const inventoryOwnedUrl = `https://inventory.roblox.com/v1/users/${rbxuserId}/items/Asset/${process.env.SHIRT_ID}/is-owned`;
-    const inventoryOwnedInfoResponse = await axios.get(inventoryOwnedUrl);
+    const shirtId = process.env.SHIRT_ID || '209995366';
+    const inventoryOwnedUrl = `${CLOUD_API_BASE_URL}/v1/users/${rbxuserId}/items/Asset/${shirtId}/is-owned`;
+    const inventoryOwnedInfoResponse = await axios.get(inventoryOwnedUrl, { timeout: 15000 });
     const inventoryOwnedInfoData = inventoryOwnedInfoResponse.data;
 
-    if (!inventoryOwnedInfoData) {
+    if (!inventoryOwnedInfoData || inventoryOwnedInfoData.isOwned !== true) {
       return res.status(403).json({
         message: 'Please Purchase The Shirt',
       });
     }
 
-    const rbxUserTaken = await client.query(
-      q.Exists(q.Match(q.Index('tokens_by_rbx_user_id'), rbxuserId))
+    const existingToken = await pool.query(
+      'SELECT * FROM tokens WHERE rbx_user_id = $1 LIMIT 1',
+      [rbxuserId]
     );
 
-    if (rbxUserTaken) {
+    if (existingToken.rows[0]) {
       return res.status(409).json({ message: 'This Account Already Purchase to Site' });
     }
 
     const token = `${generateToken(7)}-${generateToken(7)}-${generateToken(7)}`;
 
-    const newToken = await client.query(
-      q.Create(q.Collection('tokens'), {
-        data: {
-          token: token,
-          is_used: false,
-          rbx_user_id: rbxuserId,
-        },
-      })
+    await pool.query(
+      'INSERT INTO tokens (token, is_used, rbx_user_id) VALUES ($1, false, $2)',
+      [token, rbxuserId]
     );
 
-    // CSS styles for the email template
     const emailStyles = `
       <style>
       body {
@@ -133,7 +121,6 @@ async function purchaseapi(req, res) {
       </style>
     `;
 
-    // HTML template for the password reset email
     const emailTemplate = `
       <html>
       <head>
@@ -154,22 +141,19 @@ async function purchaseapi(req, res) {
       </html>
     `;
 
-    const mailOptions = {
+    await transporter.sendMail({
       from: process.env.SMTP_FROM,
       to: email,
       subject: 'Thank For Purchasing',
       html: emailTemplate,
-    };
-
-    await transporter.sendMail(mailOptions);
-
-    res.status(200).json({
-      message: 'Successfully Purchase',
     });
 
+    return res.status(200).json({
+      message: 'Successfully Purchase',
+    });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({
+    console.error('Purchase API error:', error.response ? error.response.data : error.message);
+    return res.status(500).json({
       error: 'Failed to Purchase',
     });
   }
