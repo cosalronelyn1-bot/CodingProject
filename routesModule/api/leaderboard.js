@@ -1,42 +1,27 @@
 require('dotenv').config();
-const faunadb = require('faunadb');
-
-const client = new faunadb.Client({
-  secret: process.env.FAUNADB_SECRET,
-});
-const q = faunadb.query;
+const { pool, findSessionByToken, getUserById } = require('../../../database');
 
 async function leaderboardapi(req, res) {
   try {
-    const leaderboard = await client.query(
-      q.Map(
-        q.Paginate(q.Documents(q.Collection('users'))),
-        q.Lambda('user', {
-          username: q.Select(['data', 'username'], q.Get(q.Var('user'))),
-          robux: q.Select(['data', 'stats', 'robux'], q.Get(q.Var('user'))),
-          points: q.Select(['data', 'stats', 'points'], q.Get(q.Var('user'))),
-          revenue: q.Select(['data', 'stats', 'revenue'], q.Get(q.Var('user'))),
-          profile_pic: q.Select(['data', 'profile_pic'], q.Get(q.Var('user'))),
-        })
-      )
+    const result = await pool.query(
+      `SELECT username, stats->>'robux' AS robux, stats->>'points' AS points, stats->>'revenue' AS revenue, profile_pic
+       FROM users
+       ORDER BY (stats->>'robux')::numeric DESC LIMIT 10`
     );
 
-    const leaderboardData = leaderboard.data
-      .map((entry, index) => ({
-        rank: index + 1,
-        username: entry.username,
-        robux: entry.robux,
-        points: entry.points,
-        revenue: entry.revenue,
-        profile_pic: entry.profile_pic,
-      }))
-      .sort((a, b) => b.robux - a.robux)
-      .slice(0, 10); // Add this line to limit the entries to 10.
+    const leaderboardData = result.rows.map((entry, index) => ({
+      rank: index + 1,
+      username: entry.username,
+      robux: Number(entry.robux || 0),
+      points: Number(entry.points || 0),
+      revenue: Number(entry.revenue || 0),
+      profile_pic: entry.profile_pic,
+    }));
 
-    res.json({ leaderboard: leaderboardData });
+    return res.json({ leaderboard: leaderboardData });
   } catch (error) {
     console.error('Error retrieving leaderboard:', error);
-    res.status(500).json({ error: 'An error occurred while retrieving the leaderboard' });
+    return res.status(500).json({ error: 'An error occurred while retrieving the leaderboard' });
   }
 }
 
